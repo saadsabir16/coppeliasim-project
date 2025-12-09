@@ -1,0 +1,201 @@
+function sysCall_init()
+    sim = require('sim')
+    simIK = require('simIK')
+end
+
+function sysCall_thread()
+    -- 1. INITIALIZATION PHASE
+    simRemoteApi.start(19999)
+    print("=== Initializing Vision-Based Color Sorter (THREADED) ===")
+
+    simBase = sim.getObject('/UR5')
+    simTip = sim.getObject('/tip')
+    simGoal = sim.getObject('/goalPose')
+
+    simJoints = {}
+    for i = 1, 6 do
+        simJoints[i] = sim.getObject('/UR5/joint', { index = i - 1 })
+    end
+
+    -- Home Position Setup
+    local homeJointPositions = { 0.0, 0.50, 0.90, -0.80, -1.57, 0.0 }
+    for i = 1, #simJoints do
+        sim.setJointPosition(simJoints[i], homeJointPositions[i])
+        sim.setJointTargetPosition(simJoints[i], homeJointPositions[i])
+    end
+
+    dynModel = sim.isDynamicallyEnabled(simJoints[1])
+
+    -- IK Setup
+    ikEnv = simIK.createEnvironment()
+    ikGroup = simIK.createGroup(ikEnv)
+    ikElement, simToIkMap = simIK.addElementFromScene(
+        ikEnv,
+        ikGroup,
+        simBase,
+        simTip,
+        simGoal,
+        simIK.constraint_position
+    )
+
+    -- Relaxed IK settings
+    simIK.setElementPrecision(ikEnv, ikGroup, ikElement, { 0.01, 0.1 })
+    simIK.setElementWeights(ikEnv, ikGroup, ikElement, { 1, 1, 1, 0.01, 0.01, 0.01 }) -- Low weight on orientation
+
+    ikTip = simToIkMap[simTip]
+    ikJoints = {}
+    for i = 1, #simJoints do
+        ikJoints[i] = simToIkMap[simJoints[i]]
+    end
+
+    -- Gripper Setup
+    gripperJoints = {}
+    local gripperNames = { '/jointA_0', '/jointA_2' }
+    for _, name in ipairs(gripperNames) do
+        local success, joint = pcall(sim.getObject, name)
+        if success then
+            table.insert(gripperJoints, joint)
+        end
+    end
+
+    -- Open gripper initially
+    setGripperState(false)
+
+    print("System Ready. Waiting for MATLAB commands...")
+
+    -- 2. MAIN EXECUTION LOOP (Keeps the script running)
+    while not sim.getSimulationStopping() do
+        -- Check for MOVE command
+        local moveCmd = sim.getInt32Signal('moveCommand')
+        if moveCmd and moveCmd ~= 0 then
+            sim.clearInt32Signal('moveCommand')
+
+            -- Clear previous movementComplete flag (if any)
+            sim.clearInt32Signal('movementComplete')
+
+            local goalPos = sim.getObjectPosition(simGoal, -1)
+            local tipPos = sim.getObjectPosition(simTip, -1)
+            print(string.format(
+                "CMD %d: Moving to [%.3f, %.3f, %.3f]",
+                moveCmd,
+                goalPos[1],
+                goalPos[2],
+                goalPos[3]
+            ))
+
+            local success = moveToGoalStable()
+
+            if success then
+                print("  > Movement Success")
+            else
+                print("  > Movement Warning")
+            end
+
+            -- Signal MATLAB that we are done
+            sim.setInt32Signal('movementComplete', 1)
+        end
+
+        -- Check for GRIPPER command
+        local gripperCmd = sim.getInt32Signal('gripperCommand')
+        if gripperCmd ~= nil then
+            sim.clearInt32Signal('gripperCommand')
+            print("CMD: Gripper " .. (gripperCmd == 1 and "CLOSE" or "OPEN"))
+            setGripperState(gripperCmd == 1)
+
+            -- Wait for gripper to actuate physically
+            local waitTime = sim.getSimulationTime() + 1.0
+            while sim.getSimulationTime() < waitTime do
+                sim.step()
+            end
+        end
+
+        -- CRITICAL: Yield to next simulation frame
+        sim.step()
+    end
+
+    -- 3. CLEANUP
+    if ikEnv then
+        simIK.eraseEnvironment(ikEnv)
+    end
+    simRemoteApi.stop(19999)
+end
+
+-- === HELPER FUNCTIONS ===
+
+function moveToGoalStable()
+    local path = simIK.generatePath(ikEnv, ikGroup, ikJoints, ikTip, 100) -- 100 steps
+
+    if path and #path > 0 then
+        executePathStably(path, simJoints, dynModel)
+        return true
+    else
+        print("  > Path generation failed, trying iterative IK...")
+        return moveWithStableIK()
+    end
+end
+
+function executePathStably(path, joints, dynModel)
+    local totalConfigs = #path / 6
+
+    for configIdx = 1, totalConfigs do
+        for jointIdx = 1, #joints do
+            local targetPos = path[(configIdx - 1) * 6 + jointIdx]
+            if dynModel then
+                sim.setJointTargetPosition(joints[jointIdx], targetPos)
+            else
+                sim.setJointPosition(joints[jointIdx], targetPos)
+            end
+        end
+        sim.step()
+    end
+end
+
+function moveWithStableIK()
+    local maxIter = 200
+    local goalPos = sim.getObjectPosition(simGoal, -1)
+
+    for iter = 1, maxIter do
+        simIK.handleGroup(ikEnv, ikGroup, { syncWorlds = true })
+
+        -- Apply IK result to robot
+        for i = 1, #simJoints do
+            local jointPos = simIK.getJointPosition(ikEnv, ikJoints[i])
+            if dynModel then
+                sim.setJointTargetPosition(simJoints[i], jointPos)
+            else
+                sim.setJointPosition(simJoints[i], jointPos)
+            end
+        end
+
+        sim.step()
+
+        -- Check distance
+        local currentPos = sim.getObjectPosition(simTip, -1)
+        local dx = currentPos[1] - goalPos[1]
+        local dy = currentPos[2] - goalPos[2]
+        local dz = currentPos[3] - goalPos[3]
+        local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+        if dist < 0.05 then
+            return true
+        end
+    end
+    return false
+end
+
+function setGripperState(close)
+    if #gripperJoints == 0 then
+        return
+    end
+    local velocity = 0.04
+    local force = 20
+
+    for i = 1, #gripperJoints do
+        if close then
+            sim.setJointTargetVelocity(gripperJoints[i], -velocity)
+        else
+            sim.setJointTargetVelocity(gripperJoints[i], velocity)
+        end
+        sim.setJointMaxForce(gripperJoints[i], force)
+    end
+end
